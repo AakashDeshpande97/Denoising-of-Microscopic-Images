@@ -1,19 +1,16 @@
 """
-Denoising method comparison: Median / Wiener / BM3D filters vs.
-Zero-Shot Noise2Noise (ZS-N2N).
+Core denoising comparison logic: Median / Wiener / BM3D vs. ZS-N2N.
 
-Reproduces the comparison study from the research notebooks
-(Non-DL filters + ZS-N2N), as a single runnable script.
-
-Usage:
-    python compare_denoising.py --input test.jpg --output comparison.png --add-noise g --noise-level 25
+Same logic as before - this file just exposes it as a function
+(run_comparison_bytes) that both a CLI script and a web API can call,
+instead of only being runnable from the command line.
 """
-import argparse
+import io
 
 import bm3d
 import cv2
 import matplotlib
-matplotlib.use("Agg")  # no display available inside a container
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -23,19 +20,16 @@ import torch.optim as optim
 from scipy.signal import wiener as scipy_wiener
 
 
-# shared utilities 
-
 def calc_psnr(clean, pred):
     mse = np.mean((clean - pred) ** 2)
-    if mse == 0:
-        return float("inf")
-    return 10 * np.log10(1 / mse)
+    return 10 * np.log10(1 / mse) if mse > 0 else float("inf")
 
 
-def load_grayscale(path, size=256):
-    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+def bytes_to_grayscale(image_bytes, size=256):
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        raise FileNotFoundError(f"Could not read image: {path}")
+        raise ValueError("Could not decode image - is this a valid image file?")
     img = cv2.resize(img, (size, size))
     return img.astype(np.float32) / 255.0
 
@@ -54,8 +48,6 @@ def add_noise(image, noise_type, noise_level, seed=42):
     return image.astype(np.float32)
 
 
-# classical filters (from the Non-DL notebook)
-
 def median_filter(image_uint8, kernel=3):
     return cv2.medianBlur(image_uint8, kernel).astype(np.float32)
 
@@ -68,8 +60,6 @@ def wiener_filter(image, kernel=3):
 def bm3d_filter(image, sigma_psd=0.1):
     return bm3d.bm3d(image, sigma_psd).astype(np.float32)
 
-
-#  ZS-N2N deep learning method (from the ZS-N2N notebook)
 
 class Network(nn.Module):
     def __init__(self, n_chan, chan_embed=48):
@@ -92,7 +82,7 @@ def pair_downsampler(img):
     return F.conv2d(img, f1, stride=2, groups=c), F.conv2d(img, f2, stride=2, groups=c)
 
 
-def zsn2n_denoise(noisy_np, epochs=500, lr=0.001, step_size=1000, gamma=0.5):
+def zsn2n_denoise(noisy_np, epochs=300, lr=0.001, step_size=1000, gamma=0.5):
     noisy_t = torch.from_numpy(noisy_np).unsqueeze(0).unsqueeze(0)
     model = Network(1)
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -116,19 +106,15 @@ def zsn2n_denoise(noisy_np, epochs=500, lr=0.001, step_size=1000, gamma=0.5):
     return denoised.squeeze().numpy()
 
 
-#  run all methods and build comparison output 
-def main():
-    parser = argparse.ArgumentParser(description="Compare denoising methods: Median / Wiener / BM3D / ZS-N2N")
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--output", required=True, help="Path to save the comparison grid image")
-    parser.add_argument("--add-noise", default="g", choices=["g", "p", "u", "n"])
-    parser.add_argument("--noise-level", type=float, default=25.0)
-    parser.add_argument("--epochs", type=int, default=500,
-                         help="ZS-N2N training epochs (notebook default was 3000; 500 is faster for a demo)")
-    args = parser.parse_args()
-
-    clean = load_grayscale(args.input)
-    noisy = add_noise(clean, args.add_noise, args.noise_level)
+def run_comparison_bytes(image_bytes, noise_type="g", noise_level=25.0, epochs=300):
+    """
+    Takes raw image bytes (e.g. an uploaded file), runs all four denoising
+    methods, and returns the comparison grid as PNG bytes + a dict of PSNR
+    results. This is the function both the CLI and the API call - the one
+    place the actual pipeline logic lives.
+    """
+    clean = bytes_to_grayscale(image_bytes)
+    noisy = add_noise(clean, noise_type, noise_level)
 
     imgs = {"Noisy": noisy}
     psnr = {"Noisy": calc_psnr(clean, noisy)}
@@ -145,12 +131,10 @@ def main():
     imgs["BM3D"] = b
     psnr["BM3D"] = calc_psnr(clean, b)
 
-    print(f"Running ZS-N2N for {args.epochs} epochs (zero-shot on this image)...")
-    z = zsn2n_denoise(noisy, epochs=args.epochs)
+    z = zsn2n_denoise(noisy, epochs=epochs)
     imgs["ZS-N2N (DL)"] = z
     psnr["ZS-N2N (DL)"] = calc_psnr(clean, z)
 
-    # Build the comparison grid (same idea as the notebook's plt.subplot layout).
     fig, axes = plt.subplots(1, len(imgs) + 1, figsize=(4 * (len(imgs) + 1), 4))
     axes[0].imshow(clean, cmap="gray")
     axes[0].set_title("Ground Truth")
@@ -162,13 +146,9 @@ def main():
         ax.axis("off")
 
     plt.tight_layout()
-    plt.savefig(args.output, bbox_inches="tight", dpi=120)
-    print(f"Saved comparison grid to {args.output}")
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight", dpi=120)
+    plt.close(fig)
+    buf.seek(0)
 
-    print("\nPSNR results (dB):")
-    for name, val in psnr.items():
-        print(f"  {name}: {val:.2f}")
-
-
-if __name__ == "__main__":
-    main()
+    return buf.getvalue(), psnr
