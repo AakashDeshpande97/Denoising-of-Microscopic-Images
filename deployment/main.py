@@ -1,3 +1,4 @@
+# CI/CD pipeline test - automated deploy via GitHub Actions
 """
 FastAPI wrapper around denoising_core.py.
 
@@ -5,6 +6,8 @@ This is the "receptionist's desk" - it stays running, listens for
 requests, and calls your actual denoising logic (denoising_core.py)
 whenever someone sends an image.
 """
+
+
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 
